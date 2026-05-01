@@ -33,14 +33,10 @@ PlatformIO firmware for **Seeed Studio XIAO nRF52840 Sense** (`board = xiaoblese
    - **Rate:** nominally **~200 Hz** (`kRecordSamplePeriodMs = 5`). See [Sample rate vs BLE](#sample-rate-vs-ble) below.
    - **Constants:** `kRecordDurationMs`, `kRecordSamplePeriodMs`, buffer sizing in `src/main.cpp`.
 
-6. **Serial dump of recordings (bring-up)**  
-   After each recording, firmware prints **human CSV**:
+6. **Serial during recordings**  
+   Human-readable **CSV dumps after each capture are disabled** (Serial noise). Inspect captures via the app’s BLE NOTIFY stream instead. Serial still logs tap snapshots and transfer tracing (`BLE: META …`, each `BLE: CHUNK …`, completion).
 
-   - Header metadata (`window_id`, nominal sample rate, row count) plus lines:  
-     `t_ms,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw`  
-     (`t_ms` is nominal: sample index × period, for a stable ML timeline.)
-
-   **BLE framing helper:** `packImuSampleBleLittleEndian()` writes **14 bytes/sample** (little-endian `uint16_t t_ms`, then six `int16_t` raw axes). Reserved for GATT notifications—no hex mirror on Serial.
+   **BLE framing helper:** `packImuSampleBleLittleEndian()` writes **14 bytes/sample** (little-endian `uint16_t t_ms`, then six `int16_t` raw axes); NOTIFY **`ADAB0003`** streams packed recordings after each accepted capture when a central is linked.
 
 7. **Serial**  
    **115200 baud** (`platformio.ini` → `monitor_speed`). On boot, firmware waits briefly for USB Serial so logs appear when a monitor is open without blocking forever when USB is unplugged. BLE setup also logs success/failure (`BLE: advertising as "…"` or `advertise() failed`).
@@ -50,10 +46,18 @@ PlatformIO firmware for **Seeed Studio XIAO nRF52840 Sense** (`board = xiaoblese
 
    - **Friendly name:** `kBleDeviceName` in `src/main.cpp` → `BLE.setDeviceName()` (GAP Device Name; mbed defaults to `"Arduino"` if omitted per [ArduinoBLE `setDeviceName`](https://github.com/arduino-libraries/ArduinoBLE/blob/master/docs/api.md)) plus advertising / scan response via `BLEAdvertisingData` and `BLE.setLocalName()`.
    - **Advertising:** Primary payload carries **flags + Complete Local Name** so the name fits in **31 bytes**. A **128-bit service UUID is not broadcast** in ADV (it would crowd out the name); the custom service still exists **on GATT** after connect.
-   - **Custom GATT (placeholder):** Service **`ADAB0001-0000-1000-8000-00805F9B34FB`**, read-only byte characteristic **`ADAB0002-0000-1000-8000-00805F9B34FB`** — extend when streaming IMU.
-   - **Main loop:** `BLE.poll()` runs with IMU idle (`__WFI()`), recording waits, and between tap handling so the stack stays serviced.
+   - **Custom GATT:** Service **`ADAB0001-0000-1000-8000-00805F9B34FB`**
+     - Read-only byte **`ADAB0002-…`** (status placeholder).
+     - **`ADAB0003-…` NOTIFY stream:** after each **accepted** recording, if a central is connected, firmware sends a **framed binary transfer**:
+       1. **META** (`pkt=1`): `window_id`, `sample_count`, `payload_total_bytes` (= `sample_count × 14`), `proto_ver=1`.
+       2. **CHUNK** (`pkt=2`): after the 4-byte frame: **`seq` u16 @0, `byte_offset` u32 @2, `chunk_len` u16 @6**, **4 reserved bytes @8–11** (send zeros), then **`chunk_len`** payload bytes. Payload per NOTIFY is capped (**`kBleMaxChunkPayloadBytes`**, default **158**) so each PDU fits **ATT_MTU−3** on typical iOS centrals.
+       3. **COMMIT** (`pkt=3`): `window_id`, `sample_count`, **IEEE CRC-32** over the concatenated payload.
+       Each PDU begins with magic **`0xADAB`** (LE `uint16`), `pkt` byte, reserved `0`.
+     - Sample packing: LE **`uint16_t t_ms`**, then six LE **`int16_t`** raw accel/gyro (`packImuSampleBleLittleEndian`).
+   - **Link-up cue:** When a central **first connects** (GAP link established after “pairing” from the phone), firmware runs **`bleHandshakeLedCue()`** — three quick **cyan ↔ magenta** bursts on the RGB LED (distinct from the double-tap rainbow). Serial prints `BLE: central connected (link up).` Disconnect clears the latch so the next connection flashes again.
+   - **Main loop:** **`blePollServicing()`** wraps **`BLE.poll()`** and is used everywhere the stack is serviced so connection edges are detected while waiting for double-tap (`idleUntilDoubleTapInterrupt`), during LED cues, recording, and NOTIFY chunk pacing.
 
-   Dependencies: [`arduino-libraries/ArduinoBLE`](https://github.com/arduino-libraries/ArduinoBLE) in `platformio.ini`. **Notify/streaming IMU over BLE** is still the next step after this advertising bring-up.
+   Dependencies: [`arduino-libraries/ArduinoBLE`](https://github.com/arduino-libraries/ArduinoBLE) in `platformio.ini`. The React Native app subscribes to **`ADAB0003`** and reassembles recordings with the same CRC rules (partial transfers are discarded).
 
 ## IMU (LSM6DS3TR-C)
 

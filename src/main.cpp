@@ -2,6 +2,7 @@
 #include <ArduinoBLE.h>
 #include <LSM6DS3.h>
 #include <math.h>
+#include <string.h>
 
 /** Shown in BLE scan lists. Also call BLE.setDeviceName — mbed defaults GAP name to "Arduino" if unset (ArduinoBLE docs). */
 static constexpr char kBleDeviceName[] = "XA_Abracadabra";
@@ -13,6 +14,20 @@ static constexpr char kBleDeviceName[] = "XA_Abracadabra";
 BLEService abracadabraService("ADAB0001-0000-1000-8000-00805F9B34FB");
 BLEUnsignedCharCharacteristic abracadabraStatusChar(
     "ADAB0002-0000-1000-8000-00805F9B34FB", BLERead);
+/** META notify only (payload layout matches RN); bulk bytes pulled via ADAB0004/0005. */
+BLECharacteristic abracadabraStreamChar(
+    "ADAB0003-0000-1000-8000-00805F9B34FB", BLENotify, 244);
+/** Central writes uint32 LE byte offset, then reads ADAB0005 for that slice (reliable vs notify flood). */
+BLECharacteristic abracadabraPullCtrlChar(
+    "ADAB0004-0000-1000-8000-00805F9B34FB", BLEWrite, 4);
+BLECharacteristic abracadabraPullDataChar(
+    "ADAB0005-0000-1000-8000-00805F9B34FB", BLERead, 244);
+
+static constexpr uint16_t kBleFrameMagic = 0xADAB;
+static constexpr uint8_t kBlePktMeta = 1;
+static constexpr uint8_t kBlePktChunk = 2;
+static constexpr uint8_t kBlePktCommit = 3;
+static constexpr uint8_t kBleProtoVer = 1;
 
 // RGB LEDs — active LOW on Seeed XIAO BLE Sense (mbed core)
 #define LED_R LEDR
@@ -72,6 +87,42 @@ static void ledSet(uint8_t r, uint8_t g, uint8_t b) {
   digitalWrite(LED_R, r ? LOW : HIGH);
   digitalWrite(LED_G, g ? LOW : HIGH);
   digitalWrite(LED_B, b ? LOW : HIGH);
+}
+
+/** Tracks BLE central connection for edge-triggered “handshake” LED cue. */
+static bool sBleCentralWasConnected = false;
+
+static void blePollServicing();
+
+static void serviceBlePullRequests();
+
+/** Short cyan/magenta bursts — distinct from double-tap rainbow; runs during link-up. */
+static void bleHandshakeLedCue() {
+  constexpr uint16_t stepMs = 70;
+  for (int i = 0; i < 3; i++) {
+    ledSet(0, 1, 1);  // cyan
+    delay(stepMs);
+    blePollServicing();
+    ledSet(1, 0, 1);  // magenta
+    delay(stepMs);
+    blePollServicing();
+  }
+  ledOff();
+}
+
+/** Process BLE events and flash LEDs once when a central connects (link established). */
+static void blePollServicing() {
+  BLE.poll();
+  serviceBlePullRequests();
+  BLEDevice central = BLE.central();
+  const bool connected = central && central.connected();
+  if (connected && !sBleCentralWasConnected) {
+    sBleCentralWasConnected = true;
+    Serial.println(F("BLE: central connected (link up)."));
+    bleHandshakeLedCue();
+  } else if (!connected) {
+    sBleCentralWasConnected = false;
+  }
 }
 
 /** ST AN5130 §5.5.5 — double-tap to INT1. Gyro at same ODR as XL for snapshot reads. */
@@ -266,10 +317,10 @@ static bool serialPrintImuSnapshot(uint8_t tapSrc) {
  * uint16_t t_ms + int16_t ax, ay, az, gx, gy, gz — **14 bytes** total.
  * Use when streaming via GATT; not printed on Serial for now.
  */
-[[maybe_unused]] static constexpr size_t kBlePackedSampleBytes = 14;
+static constexpr size_t kBlePackedSampleBytes = 14;
 
-[[maybe_unused]] static void packImuSampleBleLittleEndian(const ImuRecordSample& s,
-                                                           uint8_t out[kBlePackedSampleBytes]) {
+static void packImuSampleBleLittleEndian(const ImuRecordSample& s,
+                                         uint8_t out[kBlePackedSampleBytes]) {
   out[0] = static_cast<uint8_t>(s.t_ms & 0xFF);
   out[1] = static_cast<uint8_t>((s.t_ms >> 8) & 0xFF);
   const int16_t* axes[] = {&s.ax, &s.ay, &s.az, &s.gx, &s.gy, &s.gz};
@@ -279,6 +330,154 @@ static bool serialPrintImuSnapshot(uint8_t tapSrc) {
     *p++ = static_cast<uint8_t>(u & 0xFF);
     *p++ = static_cast<uint8_t>((u >> 8) & 0xFF);
   }
+}
+
+static uint8_t sBlePackedRecording[kRecordMaxSamples * kBlePackedSampleBytes];
+
+/** Pull-model transfer: valid after META notify succeeds until the next capture overwrites the buffer. */
+static bool sBlePullReady = false;
+static uint32_t sBlePullTotalBytes = 0;
+static uint8_t* sBlePullPackedPtr = nullptr;
+
+/**
+ * Central writes 4-byte LE offset to pull-ctrl; we stage pull-data for the following READ.
+ */
+static void serviceBlePullRequests() {
+  if (!abracadabraPullCtrlChar.written()) {
+    return;
+  }
+  uint32_t off = 0;
+  if (abracadabraPullCtrlChar.valueLength() >= 4) {
+    const uint8_t* v = abracadabraPullCtrlChar.value();
+    off = static_cast<uint32_t>(v[0]) | (static_cast<uint32_t>(v[1]) << 8) |
+          (static_cast<uint32_t>(v[2]) << 16) | (static_cast<uint32_t>(v[3]) << 24);
+  }
+
+  uint8_t sliceBuf[244];
+  size_t n = 0;
+  if (sBlePullReady && sBlePullPackedPtr != nullptr && off < sBlePullTotalBytes) {
+    const uint32_t remain = sBlePullTotalBytes - off;
+    const size_t maxLen = sizeof(sliceBuf);
+    n = static_cast<size_t>(remain < maxLen ? remain : maxLen);
+    memcpy(sliceBuf, sBlePullPackedPtr + off, n);
+  }
+  abracadabraPullDataChar.writeValue(sliceBuf, static_cast<int>(n));
+}
+
+static void putU16Le(uint8_t* p, uint16_t v) {
+  p[0] = static_cast<uint8_t>(v & 0xFF);
+  p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+}
+
+static void putU32Le(uint8_t* p, uint32_t v) {
+  p[0] = static_cast<uint8_t>(v & 0xFF);
+  p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+  p[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+  p[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
+}
+
+/** IEEE CRC-32 (same polynomial as PNG / Ethernet); matches app assembler. */
+static uint32_t crc32Ieee(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; ++b) {
+      crc = (crc >> 1U) ^ (0xEDB88320UL & (uint32_t)-(int32_t)(crc & 1U));
+    }
+  }
+  return crc ^ 0xFFFFFFFFUL;
+}
+
+/**
+ * Notify one framed packet: magic LE, pkt type, reserved, payload.
+ * Returns false if peripheral disconnected or notify fails.
+ */
+static bool bleNotifyFramed(uint8_t pktType, const uint8_t* payload, size_t payloadLen) {
+  BLEDevice central = BLE.central();
+  if (!central || !central.connected()) {
+    return false;
+  }
+  constexpr size_t kHdr = 4;
+  if (payloadLen + kHdr > static_cast<size_t>(abracadabraStreamChar.valueSize())) {
+    return false;
+  }
+  uint8_t buf[244];
+  putU16Le(buf, kBleFrameMagic);
+  buf[2] = pktType;
+  buf[3] = 0;
+  if (payloadLen > 0 && payload != nullptr) {
+    memcpy(buf + kHdr, payload, payloadLen);
+  }
+  const int n = static_cast<int>(kHdr + payloadLen);
+  blePollServicing();
+  const bool ok = abracadabraStreamChar.writeValue(buf, n);
+  blePollServicing();
+  return ok;
+}
+
+/**
+ * Notify META (includes CRC); central pulls payload with write-offset + read-data (ADAB0004/0005).
+ */
+static void bleTryPushRecording(uint16_t windowId, uint16_t sampleCount) {
+  if (sampleCount == 0) {
+    return;
+  }
+
+  sBlePullReady = false;
+  sBlePullPackedPtr = nullptr;
+  sBlePullTotalBytes = 0;
+
+  BLEDevice central = BLE.central();
+  if (!central || !central.connected()) {
+    Serial.println(F("BLE: recording ready but no central — skipping transfer."));
+    return;
+  }
+
+  uint8_t* packed = sBlePackedRecording;
+  const uint32_t totalBytes =
+      static_cast<uint32_t>(sampleCount) * static_cast<uint32_t>(kBlePackedSampleBytes);
+  if (totalBytes > sizeof(sBlePackedRecording)) {
+    Serial.println(F("BLE: packed recording overflow."));
+    return;
+  }
+
+  for (uint16_t i = 0; i < sampleCount; ++i) {
+    packImuSampleBleLittleEndian(sRecordBuf[i], packed + static_cast<size_t>(i) * kBlePackedSampleBytes);
+  }
+
+  const uint32_t crc = crc32Ieee(packed, totalBytes);
+
+  Serial.print(F("BLE: META win="));
+  Serial.print(windowId);
+  Serial.print(F(" samples="));
+  Serial.print(sampleCount);
+  Serial.print(F(" totalBytes="));
+  Serial.print(totalBytes);
+  Serial.print(F(" crc=0x"));
+  Serial.println(crc, HEX);
+
+  uint8_t meta[16];
+  putU16Le(meta + 0, windowId);
+  putU16Le(meta + 2, sampleCount);
+  putU32Le(meta + 4, totalBytes);
+  meta[8] = kBleProtoVer;
+  meta[9] = 0;
+  meta[10] = 0;
+  meta[11] = 0;
+  putU32Le(meta + 12, crc);
+
+  sBlePullPackedPtr = packed;
+  sBlePullTotalBytes = totalBytes;
+
+  if (!bleNotifyFramed(kBlePktMeta, meta, sizeof(meta))) {
+    Serial.println(F("BLE: META notify failed."));
+    sBlePullPackedPtr = nullptr;
+    sBlePullTotalBytes = 0;
+    return;
+  }
+
+  sBlePullReady = true;
+  Serial.println(F("BLE: META sent — central should GATT-pull payload (ADAB0004/0005)."));
 }
 
 /** Flash green while recording (~4 Hz). */
@@ -307,7 +506,7 @@ static uint16_t captureImuRecordingWindow() {
     recordingLedTick(elapsed);
 
     if (static_cast<int32_t>(now - nextDeadline) < 0) {
-      BLE.poll();
+      blePollServicing();
       continue;
     }
 
@@ -315,7 +514,7 @@ static uint16_t captureImuRecordingWindow() {
       break;
     }
 
-    BLE.poll();
+    blePollServicing();
 
     ImuRecordSample& s = sRecordBuf[count];
     s.t_ms = static_cast<uint16_t>(count * kRecordSamplePeriodMs);
@@ -337,74 +536,50 @@ static uint16_t captureImuRecordingWindow() {
   return count;
 }
 
-static void serialPrintRecordingHumanCsv(uint16_t windowId, uint16_t sampleCount) {
-  Serial.println();
-  Serial.println(F("=== IMU recording (human CSV) ==="));
-  Serial.print(F("window_id="));
-  Serial.println(windowId);
-  Serial.print(F("sample_rate_hz="));
-  Serial.println(1000 / kRecordSamplePeriodMs);
-  Serial.print(F("sample_period_ms="));
-  Serial.println(kRecordSamplePeriodMs);
-  Serial.print(F("duration_nominal_ms="));
-  Serial.println(static_cast<uint16_t>((sampleCount > 0) ? (sampleCount - 1U) * kRecordSamplePeriodMs : 0));
-  Serial.print(F("sample_count="));
-  Serial.println(sampleCount);
-  Serial.println(F("columns: t_ms,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw"));
-  Serial.println(F("---"));
-  for (uint16_t i = 0; i < sampleCount; ++i) {
-    const ImuRecordSample& s = sRecordBuf[i];
-    Serial.print(s.t_ms);
-    Serial.print(',');
-    Serial.print(s.ax);
-    Serial.print(',');
-    Serial.print(s.ay);
-    Serial.print(',');
-    Serial.print(s.az);
-    Serial.print(',');
-    Serial.print(s.gx);
-    Serial.print(',');
-    Serial.print(s.gy);
-    Serial.print(',');
-    Serial.println(s.gz);
-  }
-  Serial.println(F("=== end human CSV ==="));
-}
-
 /** Short animated cue: inward chase + dual sparkle + settle green. */
 static void playDoubleTapCue() {
   constexpr uint16_t stepMs = 55;
 
   ledOff();
   delay(stepMs);
+  blePollServicing();
 
   for (int rep = 0; rep < 2; rep++) {
     ledSet(1, 0, 0);
     delay(stepMs);
+    blePollServicing();
     ledSet(1, 1, 0);
     delay(stepMs);
+    blePollServicing();
     ledSet(0, 1, 0);
     delay(stepMs);
+    blePollServicing();
     ledSet(0, 1, 1);
     delay(stepMs);
+    blePollServicing();
     ledSet(0, 0, 1);
     delay(stepMs);
+    blePollServicing();
     ledSet(1, 0, 1);
     delay(stepMs);
+    blePollServicing();
     ledOff();
     delay(stepMs * 2);
+    blePollServicing();
   }
 
   for (int i = 0; i < 6; i++) {
     const bool on = (i % 2) == 0;
     ledSet(on, on, on);
     delay(40);
+    blePollServicing();
   }
 
   for (int e = 8; e >= 0; e--) {
     const bool pulse = e == 8 || e == 4 || e == 0;
     ledSet(pulse ? 0 : 0, pulse ? 1 : 0, pulse ? 0 : 0);
     delay(35);
+    blePollServicing();
   }
 
   ledOff();
@@ -412,7 +587,7 @@ static void playDoubleTapCue() {
 
 static void idleUntilDoubleTapInterrupt() {
   while (!imuIntPending) {
-    BLE.poll();
+    blePollServicing();
     __WFI();
   }
 }
@@ -458,6 +633,9 @@ void setup() {
     BLE.setLocalName(kBleDeviceName);  // scan response — stacks that merge SR still get the name
 
     abracadabraService.addCharacteristic(abracadabraStatusChar);
+    abracadabraService.addCharacteristic(abracadabraStreamChar);
+    abracadabraService.addCharacteristic(abracadabraPullCtrlChar);
+    abracadabraService.addCharacteristic(abracadabraPullDataChar);
     BLE.addService(abracadabraService);
     abracadabraStatusChar.writeValue(0);
     if (!BLE.advertise()) {
@@ -474,7 +652,7 @@ void setup() {
 }
 
 void loop() {
-  BLE.poll();
+  blePollServicing();
 
   idleUntilDoubleTapInterrupt();
   imuIntPending = false;
@@ -491,7 +669,7 @@ void loop() {
       playDoubleTapCue();
       ++sRecordingWindowId;
       const uint16_t n = captureImuRecordingWindow();
-      serialPrintRecordingHumanCsv(sRecordingWindowId, n);
+      bleTryPushRecording(sRecordingWindowId, n);
       Serial.flush();
     }
   }
