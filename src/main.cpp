@@ -1,6 +1,18 @@
 #include <Arduino.h>
+#include <ArduinoBLE.h>
 #include <LSM6DS3.h>
 #include <math.h>
+
+/** Shown in BLE scan lists. Also call BLE.setDeviceName — mbed defaults GAP name to "Arduino" if unset (ArduinoBLE docs). */
+static constexpr char kBleDeviceName[] = "XA_Abracadabra";
+
+/**
+ * Minimal GATT so Nordic stacks reliably advertise; RN app scans by name for now.
+ * Service UUID reserved for future Abracadabra data — change characteristics when streaming IMU.
+ */
+BLEService abracadabraService("ADAB0001-0000-1000-8000-00805F9B34FB");
+BLEUnsignedCharCharacteristic abracadabraStatusChar(
+    "ADAB0002-0000-1000-8000-00805F9B34FB", BLERead);
 
 // RGB LEDs — active LOW on Seeed XIAO BLE Sense (mbed core)
 #define LED_R LEDR
@@ -26,6 +38,25 @@ static constexpr float kAcceptedAccelYMaxG = 0.90f;
 static constexpr float kAcceptedAccelZMinG = -0.75f;
 static constexpr float kAcceptedAccelZMaxG = -0.35f;
 static constexpr float kStillGyroMaxDps = 40.0f;
+
+/** Post-acceptance IMU capture for ML / BLE (see README). */
+static constexpr uint16_t kRecordDurationMs = 4000;
+static constexpr uint8_t kRecordSamplePeriodMs = 5;  // ~200 Hz
+static constexpr uint16_t kRecordMaxSamples =
+    static_cast<uint16_t>(kRecordDurationMs / kRecordSamplePeriodMs + 1);
+
+struct ImuRecordSample {
+  uint16_t t_ms;
+  int16_t ax;
+  int16_t ay;
+  int16_t az;
+  int16_t gx;
+  int16_t gy;
+  int16_t gz;
+};
+
+static ImuRecordSample sRecordBuf[kRecordMaxSamples];
+static uint16_t sRecordingWindowId;
 
 static void imuInterruptHandler() {
   imuIntPending = true;
@@ -230,6 +261,116 @@ static bool serialPrintImuSnapshot(uint8_t tapSrc) {
   return acceptedCommand;
 }
 
+/**
+ * Packed BLE payload for one IMU row (little-endian):
+ * uint16_t t_ms + int16_t ax, ay, az, gx, gy, gz — **14 bytes** total.
+ * Use when streaming via GATT; not printed on Serial for now.
+ */
+[[maybe_unused]] static constexpr size_t kBlePackedSampleBytes = 14;
+
+[[maybe_unused]] static void packImuSampleBleLittleEndian(const ImuRecordSample& s,
+                                                           uint8_t out[kBlePackedSampleBytes]) {
+  out[0] = static_cast<uint8_t>(s.t_ms & 0xFF);
+  out[1] = static_cast<uint8_t>((s.t_ms >> 8) & 0xFF);
+  const int16_t* axes[] = {&s.ax, &s.ay, &s.az, &s.gx, &s.gy, &s.gz};
+  uint8_t* p = out + 2;
+  for (const int16_t* axis : axes) {
+    const uint16_t u = static_cast<uint16_t>(*axis);
+    *p++ = static_cast<uint8_t>(u & 0xFF);
+    *p++ = static_cast<uint8_t>((u >> 8) & 0xFF);
+  }
+}
+
+/** Flash green while recording (~4 Hz). */
+static void recordingLedTick(uint32_t elapsedMs) {
+  constexpr uint16_t kFlashHalfPeriodMs = 125;
+  const bool on = ((elapsedMs / kFlashHalfPeriodMs) & 1U) == 0;
+  if (on) {
+    ledSet(0, 1, 0);
+  } else {
+    ledOff();
+  }
+}
+
+/**
+ * Captures fixed-rate raw IMU samples for kRecordDurationMs.
+ * t_ms is nominal (sample index * period) for ML timeline alignment.
+ */
+static uint16_t captureImuRecordingWindow() {
+  const uint32_t wallStart = millis();
+  uint32_t nextDeadline = wallStart;
+  uint16_t count = 0;
+
+  while (count < kRecordMaxSamples) {
+    const uint32_t now = millis();
+    const uint32_t elapsed = now - wallStart;
+    recordingLedTick(elapsed);
+
+    if (static_cast<int32_t>(now - nextDeadline) < 0) {
+      BLE.poll();
+      continue;
+    }
+
+    if (elapsed >= kRecordDurationMs) {
+      break;
+    }
+
+    BLE.poll();
+
+    ImuRecordSample& s = sRecordBuf[count];
+    s.t_ms = static_cast<uint16_t>(count * kRecordSamplePeriodMs);
+    s.ax = imu.readRawAccelX();
+    s.ay = imu.readRawAccelY();
+    s.az = imu.readRawAccelZ();
+    s.gx = imu.readRawGyroX();
+    s.gy = imu.readRawGyroY();
+    s.gz = imu.readRawGyroZ();
+    count++;
+
+    nextDeadline += kRecordSamplePeriodMs;
+    if (static_cast<int32_t>(now - nextDeadline) > static_cast<int32_t>(kRecordSamplePeriodMs)) {
+      nextDeadline = now;
+    }
+  }
+
+  ledOff();
+  return count;
+}
+
+static void serialPrintRecordingHumanCsv(uint16_t windowId, uint16_t sampleCount) {
+  Serial.println();
+  Serial.println(F("=== IMU recording (human CSV) ==="));
+  Serial.print(F("window_id="));
+  Serial.println(windowId);
+  Serial.print(F("sample_rate_hz="));
+  Serial.println(1000 / kRecordSamplePeriodMs);
+  Serial.print(F("sample_period_ms="));
+  Serial.println(kRecordSamplePeriodMs);
+  Serial.print(F("duration_nominal_ms="));
+  Serial.println(static_cast<uint16_t>((sampleCount > 0) ? (sampleCount - 1U) * kRecordSamplePeriodMs : 0));
+  Serial.print(F("sample_count="));
+  Serial.println(sampleCount);
+  Serial.println(F("columns: t_ms,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw"));
+  Serial.println(F("---"));
+  for (uint16_t i = 0; i < sampleCount; ++i) {
+    const ImuRecordSample& s = sRecordBuf[i];
+    Serial.print(s.t_ms);
+    Serial.print(',');
+    Serial.print(s.ax);
+    Serial.print(',');
+    Serial.print(s.ay);
+    Serial.print(',');
+    Serial.print(s.az);
+    Serial.print(',');
+    Serial.print(s.gx);
+    Serial.print(',');
+    Serial.print(s.gy);
+    Serial.print(',');
+    Serial.println(s.gz);
+  }
+  Serial.println(F("=== end human CSV ==="));
+}
+
 /** Short animated cue: inward chase + dual sparkle + settle green. */
 static void playDoubleTapCue() {
   constexpr uint16_t stepMs = 55;
@@ -271,6 +412,7 @@ static void playDoubleTapCue() {
 
 static void idleUntilDoubleTapInterrupt() {
   while (!imuIntPending) {
+    BLE.poll();
     __WFI();
   }
 }
@@ -299,12 +441,41 @@ void setup() {
 
   attachImuInterrupt();
 
+  if (!BLE.begin()) {
+    Serial.println(F("BLE: begin() failed — scan name unavailable."));
+  } else {
+    // GATT Device Name — defaults to "Arduino" if unset (ArduinoBLE api.md).
+    BLE.setDeviceName(kBleDeviceName);
+    // Primary ADV must carry the name for many centrals (iOS / react-native-ble-plx): they often
+    // never surface scan-response-only names before showing CBPeripheral.name ("Arduino").
+    // A 128-bit UUID in ADV + full name does not fit in 31 B; we advertise name here and keep
+    // ADAB… services on GATT only (discover after connect). See Peripheral examples:
+    // https://github.com/arduino-libraries/ArduinoBLE/tree/master/examples/Peripheral
+    BLEAdvertisingData adv;
+    adv.setFlags(BLEFlagsGeneralDiscoverable | BLEFlagsBREDRNotSupported);
+    adv.setLocalName(kBleDeviceName);
+    BLE.setAdvertisingData(adv);
+    BLE.setLocalName(kBleDeviceName);  // scan response — stacks that merge SR still get the name
+
+    abracadabraService.addCharacteristic(abracadabraStatusChar);
+    BLE.addService(abracadabraService);
+    abracadabraStatusChar.writeValue(0);
+    if (!BLE.advertise()) {
+      Serial.println(F("BLE: advertise() failed."));
+    }
+    Serial.print(F("BLE: advertising as \""));
+    Serial.print(kBleDeviceName);
+    Serial.println(F("\"."));
+  }
+
   ledSet(0, 1, 0);
   delay(120);
   ledOff();
 }
 
 void loop() {
+  BLE.poll();
+
   idleUntilDoubleTapInterrupt();
   imuIntPending = false;
 
@@ -318,6 +489,10 @@ void loop() {
     Serial.flush();
     if (acceptedCommand) {
       playDoubleTapCue();
+      ++sRecordingWindowId;
+      const uint16_t n = captureImuRecordingWindow();
+      serialPrintRecordingHumanCsv(sRecordingWindowId, n);
+      Serial.flush();
     }
   }
 
