@@ -27,6 +27,8 @@ static constexpr uint16_t kBleFrameMagic = 0xADAB;
 static constexpr uint8_t kBlePktMeta = 1;
 static constexpr uint8_t kBlePktChunk = 2;
 static constexpr uint8_t kBlePktCommit = 3;
+/** Payload 4 B: window_id u16 LE, proto_ver u8, reserved u8 — sent as soon as DT is accepted (before LED cue / capture). */
+static constexpr uint8_t kBlePktRecordingPending = 4;
 static constexpr uint8_t kBleProtoVer = 1;
 
 // RGB LEDs — active LOW on Seeed XIAO BLE Sense (mbed core)
@@ -57,6 +59,11 @@ static constexpr float kStillGyroMaxDps = 40.0f;
 /** Post-acceptance IMU capture for ML / BLE (see README). */
 static constexpr uint16_t kRecordDurationMs = 4000;
 static constexpr uint8_t kRecordSamplePeriodMs = 5;  // ~200 Hz
+
+/** Extra settle after pose gate + RECORDING_PENDING notify, before LED cue (tap/mechanical decay). */
+static constexpr uint16_t kPostAcceptSettleBeforeCueMs = 480;
+/** Extra settle after LED cue ends before first IMU sample (avoid cue vibration coupling into capture). */
+static constexpr uint16_t kPostCueSettleBeforeCaptureMs = 320;
 static constexpr uint16_t kRecordMaxSamples =
     static_cast<uint16_t>(kRecordDurationMs / kRecordSamplePeriodMs + 1);
 
@@ -415,6 +422,28 @@ static bool bleNotifyFramed(uint8_t pktType, const uint8_t* payload, size_t payl
   return ok;
 }
 
+static void waitMsServicingBle(uint32_t ms) {
+  const uint32_t t0 = millis();
+  while (static_cast<int32_t>(millis() - t0) < static_cast<int32_t>(ms)) {
+    blePollServicing();
+    delay(10);
+  }
+}
+
+/** Lets the central show “capture starting” before LED cue / sampling (matches RN RecordingAssembler). */
+static bool bleNotifyRecordingPending(uint16_t windowId) {
+  uint8_t payload[4];
+  putU16Le(payload + 0, windowId);
+  payload[2] = kBleProtoVer;
+  payload[3] = 0;
+  if (!bleNotifyFramed(kBlePktRecordingPending, payload, sizeof(payload))) {
+    Serial.println(F("BLE: RECORDING_PENDING notify failed."));
+    return false;
+  }
+  Serial.println(F("BLE: RECORDING_PENDING sent."));
+  return true;
+}
+
 /**
  * Notify META (includes CRC); central pulls payload with write-offset + read-data (ADAB0004/0005).
  */
@@ -666,8 +695,11 @@ void loop() {
     const bool acceptedCommand = serialPrintImuSnapshot(tapSrc);
     Serial.flush();
     if (acceptedCommand) {
-      playDoubleTapCue();
       ++sRecordingWindowId;
+      (void)bleNotifyRecordingPending(sRecordingWindowId);
+      waitMsServicingBle(kPostAcceptSettleBeforeCueMs);
+      playDoubleTapCue();
+      waitMsServicingBle(kPostCueSettleBeforeCaptureMs);
       const uint16_t n = captureImuRecordingWindow();
       bleTryPushRecording(sRecordingWindowId, n);
       Serial.flush();
