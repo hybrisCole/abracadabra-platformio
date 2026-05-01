@@ -34,16 +34,26 @@ PlatformIO firmware for **Seeed Studio XIAO nRF52840 Sense** (`board = xiaoblese
    - **Constants:** `kRecordDurationMs`, `kRecordSamplePeriodMs`, buffer sizing in `src/main.cpp`.
 
 6. **Serial dump of recordings (bring-up)**  
-   After each recording, firmware prints **human CSV** only (BLE keeps UART quiet):
+   After each recording, firmware prints **human CSV**:
 
    - Header metadata (`window_id`, nominal sample rate, row count) plus lines:  
      `t_ms,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw`  
      (`t_ms` is nominal: sample index × period, for a stable ML timeline.)
 
-   **BLE framing** is still implemented in firmware: `packImuSampleBleLittleEndian()` writes **14 bytes/sample** (little-endian `uint16_t t_ms`, then six `int16_t` raw axes). Use that when sending notifications next—no hex mirror on Serial for now.
+   **BLE framing helper:** `packImuSampleBleLittleEndian()` writes **14 bytes/sample** (little-endian `uint16_t t_ms`, then six `int16_t` raw axes). Reserved for GATT notifications—no hex mirror on Serial.
 
 7. **Serial**  
-   **115200 baud** (`platformio.ini` → `monitor_speed`). On boot, firmware waits briefly for USB Serial so logs appear when a monitor is open without blocking forever when USB is unplugged.
+   **115200 baud** (`platformio.ini` → `monitor_speed`). On boot, firmware waits briefly for USB Serial so logs appear when a monitor is open without blocking forever when USB is unplugged. BLE setup also logs success/failure (`BLE: advertising as "…"` or `advertise() failed`).
+
+8. **Bluetooth Low Energy (ArduinoBLE)**  
+   The board runs as a **connectable peripheral** so centrals (e.g. the companion **abracadabra-rnapp** React Native project) can discover it.
+
+   - **Friendly name:** `kBleDeviceName` in `src/main.cpp` → `BLE.setDeviceName()` (GAP Device Name; mbed defaults to `"Arduino"` if omitted per [ArduinoBLE `setDeviceName`](https://github.com/arduino-libraries/ArduinoBLE/blob/master/docs/api.md)) plus advertising / scan response via `BLEAdvertisingData` and `BLE.setLocalName()`.
+   - **Advertising:** Primary payload carries **flags + Complete Local Name** so the name fits in **31 bytes**. A **128-bit service UUID is not broadcast** in ADV (it would crowd out the name); the custom service still exists **on GATT** after connect.
+   - **Custom GATT (placeholder):** Service **`ADAB0001-0000-1000-8000-00805F9B34FB`**, read-only byte characteristic **`ADAB0002-0000-1000-8000-00805F9B34FB`** — extend when streaming IMU.
+   - **Main loop:** `BLE.poll()` runs with IMU idle (`__WFI()`), recording waits, and between tap handling so the stack stays serviced.
+
+   Dependencies: [`arduino-libraries/ArduinoBLE`](https://github.com/arduino-libraries/ArduinoBLE) in `platformio.ini`. **Notify/streaming IMU over BLE** is still the next step after this advertising bring-up.
 
 ## IMU (LSM6DS3TR-C)
 
@@ -84,7 +94,7 @@ session_id,window_id,t_ms,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw
 
 **Practical note:** **200 Hz** is a good default for wrist taps and rotations before chasing full **416 Hz** capture (more samples, more BLE time, diminishing returns for many classifiers).
 
-BLE streaming is **planned**; the **14-byte LE** packing helper lives in `src/main.cpp` for the next step.
+**Peripheral advertising + GATT placeholder** are implemented; **streaming recording windows over notify** is still **planned**. The **14-byte LE** packing helper lives in `src/main.cpp`.
 
 ## Build and upload
 
