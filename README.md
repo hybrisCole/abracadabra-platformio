@@ -2,7 +2,7 @@
 
 PlatformIO firmware for **Seeed Studio XIAO nRF52840 Sense** (`board = xiaoblesense`, Nordic nRF52 Arduino mbed core).
 
-Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/link, **META + GATT pull** recording transfer, and tabbed timeline charts.
+Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/link, **META + GATT pull** recording transfer, tabbed timeline charts, crop labeling, and JSON handoff to **`abracadabra_gesture_processing`** for gesture-password training/detection.
 
 ## What this firmware does
 
@@ -55,7 +55,7 @@ Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/lin
      - **`ADAB0005-…` (read):** Central reads the slice staged after the last **`ADAB0004`** write. Repeat until **`total_bytes`** are read; verify CRC against **META**.
      - Sample packing in RAM / over the wire: LE **`uint16_t t_ms`**, then six LE **`int16_t`** accel + gyro (`packImuSampleBleLittleEndian`).
    - **Link-up cue:** When a central **first connects** (GAP link established after “pairing” from the phone), firmware runs **`bleHandshakeLedCue()`** — three quick **cyan ↔ magenta** bursts on the RGB LED (distinct from the double-tap rainbow). Serial prints `BLE: central connected (link up).` Disconnect clears the latch so the next connection flashes again.
-   - **Main loop:** **`blePollServicing()`** wraps **`BLE.poll()`** and is used everywhere the stack is serviced so connection edges are detected while waiting for double-tap (`idleUntilDoubleTapInterrupt`), during LED cues, recording, and NOTIFY chunk pacing.
+   - **Main loop:** **`blePollServicing()`** wraps **`BLE.poll()`** and is used everywhere the stack is serviced so connection edges are detected while waiting for double-tap (`idleUntilDoubleTapInterrupt`), during LED cues, recording, and GATT pull servicing.
 
    Dependencies: [`arduino-libraries/ArduinoBLE`](https://github.com/arduino-libraries/ArduinoBLE) in `platformio.ini`. The React Native app handles **`RECORDING_PENDING`** and **`META`** on **`ADAB0003`**, pulls bytes via **`ADAB0004`**/**`ADAB0005`**, and validates **CRC** (failed pulls discarded).
 
@@ -79,13 +79,18 @@ For this **nRF52840** project, driver code uses the **`Seeed Arduino LSM6DS3`** 
 
 The accepted double tap is the **human start signal**, not part of the ML clip: pose gate → **RECORDING_PENDING to phone** → **post-tap settle** → playful LEDs → **pre-capture settle** → **then** a fresh IMU window (**up to ~4 s** wall clock per **`kRecordDurationMs`**) for whatever motion follows.
 
-Recommended logical columns when you export or label data:
+Recommended JSON shape when the app labels crops or sends a full recording to **`abracadabra_gesture_processing`**:
 
-```csv
-session_id,window_id,t_ms,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw
+```json
+{
+  "window_id": 17,
+  "samples": [
+    {"t_ms": 0, "ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0}
+  ]
+}
 ```
 
-`window_id` increments per accepted recording on device; `t_ms` starts at **0** at the beginning of that post-cue window.
+`window_id` increments per accepted recording on device; `t_ms` starts at **0** at the beginning of that post-cue window. `window_id` and `t_ms` are timing/trace metadata for the app/server, not gesture identity features. The server trains on raw axes and derived motion features.
 
 ### Sample rate vs BLE
 
@@ -99,7 +104,7 @@ session_id,window_id,t_ms,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw
 
 **Practical note:** **200 Hz** nominal grid is a good default for wrist taps and rotations before chasing full **416 Hz** capture (more samples, more airtime, diminishing returns for many classifiers).
 
-**Status:** Custom service, **META** notify, **GATT pull** (`ADAB0004` / `ADAB0005`), **CRC**, and **14-byte LE** packing are implemented in `src/main.cpp` and consumed by **`abracadabra-rnapp`**.
+**Status:** Custom service, **RECORDING_PENDING** + **META** notify on **`ADAB0003`**, **GATT pull** (`ADAB0004` / `ADAB0005`), **CRC**, and **14-byte LE** packing are implemented in `src/main.cpp` and consumed by **`abracadabra-rnapp`**.
 
 ## Build and upload
 
