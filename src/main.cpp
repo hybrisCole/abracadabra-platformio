@@ -27,7 +27,7 @@ static constexpr uint16_t kBleFrameMagic = 0xADAB;
 static constexpr uint8_t kBlePktMeta = 1;
 static constexpr uint8_t kBlePktChunk = 2;
 static constexpr uint8_t kBlePktCommit = 3;
-/** Payload 4 B: window_id u16 LE, proto_ver u8, reserved u8 — sent as soon as DT is accepted (before LED cue / capture). */
+/** Payload 4 B: window_id u16 LE, proto_ver u8, reserved u8 — sent immediately before IMU capture starts (central UI aligns with data). */
 static constexpr uint8_t kBlePktRecordingPending = 4;
 static constexpr uint8_t kBleProtoVer = 1;
 
@@ -60,10 +60,6 @@ static constexpr float kStillGyroMaxDps = 40.0f;
 static constexpr uint16_t kRecordDurationMs = 4000;
 static constexpr uint8_t kRecordSamplePeriodMs = 5;  // ~200 Hz
 
-/** Extra settle after pose gate + RECORDING_PENDING notify, before LED cue (tap/mechanical decay). */
-static constexpr uint16_t kPostAcceptSettleBeforeCueMs = 480;
-/** Extra settle after LED cue ends before first IMU sample (avoid cue vibration coupling into capture). */
-static constexpr uint16_t kPostCueSettleBeforeCaptureMs = 320;
 static constexpr uint16_t kRecordMaxSamples =
     static_cast<uint16_t>(kRecordDurationMs / kRecordSamplePeriodMs + 1);
 
@@ -422,15 +418,7 @@ static bool bleNotifyFramed(uint8_t pktType, const uint8_t* payload, size_t payl
   return ok;
 }
 
-static void waitMsServicingBle(uint32_t ms) {
-  const uint32_t t0 = millis();
-  while (static_cast<int32_t>(millis() - t0) < static_cast<int32_t>(ms)) {
-    blePollServicing();
-    delay(10);
-  }
-}
-
-/** Lets the central show “capture starting” before LED cue / sampling (matches RN RecordingAssembler). */
+/** Lets the central show “recording” in sync with the IMU window (capture follows immediately after notify). */
 static bool bleNotifyRecordingPending(uint16_t windowId) {
   uint8_t payload[4];
   putU16Le(payload + 0, windowId);
@@ -697,11 +685,12 @@ void loop() {
     if (acceptedCommand) {
       ++sRecordingWindowId;
       (void)bleNotifyRecordingPending(sRecordingWindowId);
-      waitMsServicingBle(kPostAcceptSettleBeforeCueMs);
-      playDoubleTapCue();
-      waitMsServicingBle(kPostCueSettleBeforeCaptureMs);
+      for (uint8_t i = 0; i < 8; ++i) {
+        blePollServicing();
+      }
       const uint16_t n = captureImuRecordingWindow();
       bleTryPushRecording(sRecordingWindowId, n);
+      playDoubleTapCue();
       Serial.flush();
     }
   }

@@ -26,14 +26,15 @@ Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/lin
 
    In plain language: the accepted pose is an **orientation relative to gravity** where X is near neutral, Y is moderately positive, and Z is moderately negative—tuned for one wrist-held pose; change the constants if your mounting differs.
 
-4. **RGB LED cue**  
-   The playful multi-color sequence runs **only** when the double tap is **accepted** by the pose gate. Rejected double taps still emit the **Serial** snapshot (with `Command gate: REJECTED`) but **no** LED animation.
+4. **RGB LED cues**  
+   - **While recording:** after an **accepted** double tap, during IMU capture the LED shows a **flashing green** “REC” pattern (`recordingLedTick`).  
+   - **After recording:** the playful multi-color **`playDoubleTapCue()`** rainbow runs **once capture finishes** and **`META`** has been issued for GATT pull; it is **not** inserted between the phone’s **RECORDING_PENDING** indicator and the first IMU sample. Rejected double taps still emit the **Serial** snapshot (`Command gate: REJECTED`) but **no** LED animation.
 
 5. **Post-accept IMU recording (up to ~4 s wall clock)**  
-   After an **accepted** double tap, firmware **notifies the phone** with **`RECORDING_PENDING`** (framed **`pkt = 4`**) carrying the upcoming **`window_id`**, then waits **`kPostAcceptSettleBeforeCueMs`** (~**480 ms**) so mechanical tap motion decays. It plays the playful LED cue, waits **`kPostCueSettleBeforeCaptureMs`** (~**320 ms**), then captures raw accel + gyro. The clip therefore starts **well after** the double-tap impulse. The loop stops when **`millis()` elapsed ≥ `kRecordDurationMs`** (default **4000 ms**) or the ring buffer max count is reached. While capturing, the LED shows a **flashing green** “REC” pattern (`recordingLedTick`).
+   After an **accepted** double tap, firmware sends **`RECORDING_PENDING`** (framed **`pkt = 4`**) with the upcoming **`window_id`**, runs a few **`BLE.poll()`** cycles so the notify can reach the stack, then **starts sampling immediately**. There is **no** long pre-roll delay or pre-capture LED sequence—the companion app’s “recording” UI should match the IMU window closely (remaining skew is BLE connection-interval scheduling on the phone). The capture loop stops when **`millis()` elapsed ≥ `kRecordDurationMs`** (default **4000 ms**) or the ring buffer max count is reached.
 
    - **Nominal timeline:** each stored sample sets **`t_ms = sample_index × kRecordSamplePeriodMs`** (default period **5 ms** → ~200 Hz **grid**). That timestamp is for plotting / ML alignment, **not** guaranteed wall spacing if the main loop is busy (BLE polling, I²C). You may see **fewer samples** than `kRecordDurationMs / 5` over the same wall window; the app’s **Δt** label reflects **`max(t_ms) − min(t_ms)`** on received samples, not “exactly 4000 ms”.
-   - **Constants:** `kRecordDurationMs`, `kRecordSamplePeriodMs`, `kRecordMaxSamples`, `kPostAcceptSettleBeforeCueMs`, `kPostCueSettleBeforeCaptureMs` in `src/main.cpp`.
+   - **Constants:** `kRecordDurationMs`, `kRecordSamplePeriodMs`, `kRecordMaxSamples` in `src/main.cpp`.
 
 6. **Serial during recordings**  
    Human-readable **CSV dumps after each capture are disabled** (Serial noise). Inspect captures via the phone app (GATT pull after **META**). Serial still logs tap snapshots and **`BLE: META …`** / **`BLE: META sent — central should GATT-pull payload …`** tracing.
@@ -50,7 +51,7 @@ Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/lin
    - **Advertising:** Primary payload carries **flags + Complete Local Name** so the name fits in **31 bytes**. A **128-bit service UUID is not broadcast** in ADV (it would crowd out the name); the custom service still exists **on GATT** after connect.
    - **Custom GATT:** Service **`ADAB0001-0000-1000-8000-00805F9B34FB`**
      - Read-only byte **`ADAB0002-…`** (status placeholder).
-     - **`ADAB0003-…` (NOTIFY / write response channel):** Framed packets share header **magic `0xADAB`** (LE `uint16`), **`pkt` byte**, reserved **`0`**. **`RECORDING_PENDING` (`pkt = 4`):** sent **immediately** after pose acceptance — payload **4 bytes LE:** `window_id` u16, `proto_ver` u8, reserved u8 — so the central can show **“recording armed”** before sampling. **`META` (`pkt = 1`):** after capture completes — payload **16 bytes LE:** `window_id` u16, `sample_count` u16, `total_bytes` u32 (`sample_count × 14`), `proto_ver` u8 + 3 reserved bytes, **`crc_ieee_u32`** over the **full packed payload** the central must pull. No bulk payload in notify.
+     - **`ADAB0003-…` (NOTIFY / write response channel):** Framed packets share header **magic `0xADAB`** (LE `uint16`), **`pkt` byte**, reserved **`0`**. **`RECORDING_PENDING` (`pkt = 4`):** sent **immediately before** the peripheral begins filling the IMU capture buffer — payload **4 bytes LE:** `window_id` u16, `proto_ver` u8, reserved u8 — so the central can turn on **“recording”** in sync with data collection (within normal BLE timing). **`META` (`pkt = 1`):** after capture completes — payload **16 bytes LE:** `window_id` u16, `sample_count` u16, `total_bytes` u32 (`sample_count × 14`), `proto_ver` u8 + 3 reserved bytes, **`crc_ieee_u32`** over the **full packed payload** the central must pull. No bulk payload in notify.
      - **`ADAB0004-…` (write):** Central writes **4-byte little-endian byte offset** into the staged packed recording. Peripheral prepares **`ADAB0005`** read data for the **next** GATT read (pull model in `src/main.cpp`).
      - **`ADAB0005-…` (read):** Central reads the slice staged after the last **`ADAB0004`** write. Repeat until **`total_bytes`** are read; verify CRC against **META**.
      - Sample packing in RAM / over the wire: LE **`uint16_t t_ms`**, then six LE **`int16_t`** accel + gyro (`packImuSampleBleLittleEndian`).
@@ -77,7 +78,7 @@ For this **nRF52840** project, driver code uses the **`Seeed Arduino LSM6DS3`** 
 
 ## Gesture capture model
 
-The accepted double tap is the **human start signal**, not part of the ML clip: pose gate → **RECORDING_PENDING to phone** → **post-tap settle** → playful LEDs → **pre-capture settle** → **then** a fresh IMU window (**up to ~4 s** wall clock per **`kRecordDurationMs`**) for whatever motion follows.
+The accepted double tap is the **human start signal**, not part of the ML clip: pose gate → **`RECORDING_PENDING` to phone** → **IMU capture starts right away** (**up to ~4 s** wall clock per **`kRecordDurationMs`**) for whatever motion follows. The multi-color LED celebration runs **after** that window completes so it does not delay the start of tracking relative to the phone UI.
 
 Recommended JSON shape when the app labels crops or sends a full recording to **`abracadabra_gesture_processing`**:
 
@@ -90,7 +91,7 @@ Recommended JSON shape when the app labels crops or sends a full recording to **
 }
 ```
 
-`window_id` increments per accepted recording on device; `t_ms` starts at **0** at the beginning of that post-cue window. `window_id` and `t_ms` are timing/trace metadata for the app/server, not gesture identity features. The server trains on raw axes and derived motion features.
+`window_id` increments per accepted recording on device; `t_ms` starts at **0** at the beginning of that capture window (first sample after **`RECORDING_PENDING`**). `window_id` and `t_ms` are timing/trace metadata for the app/server, not gesture identity features. The server trains on raw axes and derived motion features.
 
 ### Sample rate vs BLE
 
