@@ -14,10 +14,10 @@ static constexpr char kBleDeviceName[] = "XA_Abracadabra";
 BLEService abracadabraService("ADAB0001-0000-1000-8000-00805F9B34FB");
 BLEUnsignedCharCharacteristic abracadabraStatusChar(
     "ADAB0002-0000-1000-8000-00805F9B34FB", BLERead);
-/** META notify only (payload layout matches RN); bulk bytes pulled via ADAB0004/0005. */
+/** Framed notify channel: status, META, and iOS-optimized chunk transfer. */
 BLECharacteristic abracadabraStreamChar(
     "ADAB0003-0000-1000-8000-00805F9B34FB", BLENotify, 244);
-/** Central writes uint32 LE byte offset, then reads ADAB0005 for that slice (reliable vs notify flood). */
+/** Compatibility fallback: central writes uint32 LE byte offset, then reads ADAB0005 for that slice. */
 BLECharacteristic abracadabraPullCtrlChar(
     "ADAB0004-0000-1000-8000-00805F9B34FB", BLEWrite, 4);
 BLECharacteristic abracadabraPullDataChar(
@@ -30,6 +30,17 @@ static constexpr uint8_t kBlePktCommit = 3;
 /** Payload 4 B: window_id u16 LE, proto_ver u8, reserved u8 — sent immediately before IMU capture starts (central UI aligns with data). */
 static constexpr uint8_t kBlePktRecordingPending = 4;
 static constexpr uint8_t kBleProtoVer = 1;
+/** iOS commonly exposes ATT_MTU 185, so notify values must stay <= 182 bytes (MTU - 3). */
+static constexpr size_t kBleNotifyFrameMaxBytes = 182;
+static constexpr size_t kBleGattReadMaxBytes = 244;
+static constexpr size_t kBleFrameHeaderBytes = 4;
+static constexpr size_t kBleChunkPayloadHeaderBytes = 8;  // window_id u16 + offset u32 + data_len u16
+static constexpr size_t kBleChunkDataMaxBytes =
+    kBleNotifyFrameMaxBytes - kBleFrameHeaderBytes - kBleChunkPayloadHeaderBytes;
+/** Give iOS/CoreBluetooth time to drain each notify; tune down only after on-device testing. */
+static constexpr uint8_t kBleNotifyChunkPaceMs = 15;
+/** COMMIT is tiny; repeat it so the app sees an end marker even if one notify is dropped. */
+static constexpr uint8_t kBleCommitRepeatCount = 3;
 
 // RGB LEDs — active LOW on Seeed XIAO BLE Sense (mbed core)
 #define LED_R LEDR
@@ -337,7 +348,7 @@ static void packImuSampleBleLittleEndian(const ImuRecordSample& s,
 
 static uint8_t sBlePackedRecording[kRecordMaxSamples * kBlePackedSampleBytes];
 
-/** Pull-model transfer: valid after META notify succeeds until the next capture overwrites the buffer. */
+/** Fallback pull transfer: valid after META notify succeeds until the next capture overwrites the buffer. */
 static bool sBlePullReady = false;
 static uint32_t sBlePullTotalBytes = 0;
 static uint8_t* sBlePullPackedPtr = nullptr;
@@ -356,7 +367,7 @@ static void serviceBlePullRequests() {
           (static_cast<uint32_t>(v[2]) << 16) | (static_cast<uint32_t>(v[3]) << 24);
   }
 
-  uint8_t sliceBuf[244];
+  uint8_t sliceBuf[kBleGattReadMaxBytes];
   size_t n = 0;
   if (sBlePullReady && sBlePullPackedPtr != nullptr && off < sBlePullTotalBytes) {
     const uint32_t remain = sBlePullTotalBytes - off;
@@ -400,18 +411,17 @@ static bool bleNotifyFramed(uint8_t pktType, const uint8_t* payload, size_t payl
   if (!central || !central.connected()) {
     return false;
   }
-  constexpr size_t kHdr = 4;
-  if (payloadLen + kHdr > static_cast<size_t>(abracadabraStreamChar.valueSize())) {
+  if (payloadLen + kBleFrameHeaderBytes > static_cast<size_t>(abracadabraStreamChar.valueSize())) {
     return false;
   }
-  uint8_t buf[244];
+  uint8_t buf[kBleNotifyFrameMaxBytes];
   putU16Le(buf, kBleFrameMagic);
   buf[2] = pktType;
   buf[3] = 0;
   if (payloadLen > 0 && payload != nullptr) {
-    memcpy(buf + kHdr, payload, payloadLen);
+    memcpy(buf + kBleFrameHeaderBytes, payload, payloadLen);
   }
-  const int n = static_cast<int>(kHdr + payloadLen);
+  const int n = static_cast<int>(kBleFrameHeaderBytes + payloadLen);
   blePollServicing();
   const bool ok = abracadabraStreamChar.writeValue(buf, n);
   blePollServicing();
@@ -432,8 +442,68 @@ static bool bleNotifyRecordingPending(uint16_t windowId) {
   return true;
 }
 
+static bool bleNotifyRecordingChunks(uint16_t windowId, const uint8_t* packed, uint32_t totalBytes, uint32_t crc) {
+  uint8_t payload[kBleChunkPayloadHeaderBytes + kBleChunkDataMaxBytes];
+  uint32_t offset = 0;
+  uint16_t chunkCount = 0;
+  uint32_t nextLogBytes = 1024;
+
+  while (offset < totalBytes) {
+    const uint32_t remain = totalBytes - offset;
+    const uint16_t n = static_cast<uint16_t>(
+        remain < kBleChunkDataMaxBytes ? remain : kBleChunkDataMaxBytes);
+    putU16Le(payload + 0, windowId);
+    putU32Le(payload + 2, offset);
+    putU16Le(payload + 6, n);
+    memcpy(payload + kBleChunkPayloadHeaderBytes, packed + offset, n);
+    if (!bleNotifyFramed(kBlePktChunk, payload, kBleChunkPayloadHeaderBytes + n)) {
+      Serial.println(F("BLE: CHUNK notify failed."));
+      return false;
+    }
+    offset += n;
+    chunkCount++;
+    if (offset >= nextLogBytes || offset == totalBytes) {
+      Serial.print(F("BLE: CHUNK progress chunk="));
+      Serial.print(chunkCount);
+      Serial.print(F(" bytes="));
+      Serial.print(offset);
+      Serial.print(F("/"));
+      Serial.println(totalBytes);
+      nextLogBytes += 1024;
+    }
+    if (offset < totalBytes) {
+      delay(kBleNotifyChunkPaceMs);
+      blePollServicing();
+    }
+  }
+
+  uint8_t commit[12];
+  putU16Le(commit + 0, windowId);
+  putU32Le(commit + 2, totalBytes);
+  putU32Le(commit + 6, crc);
+  commit[10] = kBleProtoVer;
+  commit[11] = 0;
+  for (uint8_t i = 0; i < kBleCommitRepeatCount; ++i) {
+    if (!bleNotifyFramed(kBlePktCommit, commit, sizeof(commit))) {
+      Serial.println(F("BLE: COMMIT notify failed."));
+      return false;
+    }
+    if (i + 1 < kBleCommitRepeatCount) {
+      delay(kBleNotifyChunkPaceMs);
+      blePollServicing();
+    }
+  }
+
+  Serial.print(F("BLE: notify chunks sent chunks="));
+  Serial.print(chunkCount);
+  Serial.print(F(" bytes="));
+  Serial.println(totalBytes);
+  return true;
+}
+
 /**
- * Notify META (includes CRC); central pulls payload with write-offset + read-data (ADAB0004/0005).
+ * Notify META (includes CRC), then stream packed bytes as iOS-friendly CHUNK notifies.
+ * ADAB0004/0005 pull remains staged as a diagnostic / compatibility fallback.
  */
 static void bleTryPushRecording(uint16_t windowId, uint16_t sampleCount) {
   if (sampleCount == 0) {
@@ -494,7 +564,12 @@ static void bleTryPushRecording(uint16_t windowId, uint16_t sampleCount) {
   }
 
   sBlePullReady = true;
-  Serial.println(F("BLE: META sent — central should GATT-pull payload (ADAB0004/0005)."));
+  Serial.println(F("BLE: META sent — streaming payload by CHUNK notify (ADAB0003)."));
+  if (!bleNotifyRecordingChunks(windowId, packed, totalBytes, crc)) {
+    Serial.println(F("BLE: notify chunk stream failed — GATT pull fallback remains staged (ADAB0004/0005)."));
+    return;
+  }
+  Serial.println(F("BLE: COMMIT sent — central should CRC/decode streamed payload."));
 }
 
 /** Flash green while recording (~4 Hz). */

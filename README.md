@@ -2,7 +2,7 @@
 
 PlatformIO firmware for **Seeed Studio XIAO nRF52840 Sense** (`board = xiaoblesense`, Nordic nRF52 Arduino mbed core).
 
-Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/link, **META + GATT pull** recording transfer, tabbed timeline charts, crop labeling, and JSON handoff to **`abracadabra_gesture_processing`** for gesture-password training/detection.
+Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/link, **META + iOS-optimized notify-chunk** recording transfer, tabbed timeline charts, crop labeling, and JSON handoff to **`abracadabra_gesture_processing`** for gesture-password training/detection. Full-recording inference may return **overlapping** gesture segments on the server; the app and server collapse those to a single password **`sequence`** (see gesture-processing README—precedence `wrist_rotation` > `double_tap` > `tap` > `still`).
 
 ## What this firmware does
 
@@ -28,7 +28,7 @@ Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/lin
 
 4. **RGB LED cues**  
    - **While recording:** after an **accepted** double tap, during IMU capture the LED shows a **flashing green** “REC” pattern (`recordingLedTick`).  
-   - **After recording:** the playful multi-color **`playDoubleTapCue()`** rainbow runs **once capture finishes** and **`META`** has been issued for GATT pull; it is **not** inserted between the phone’s **RECORDING_PENDING** indicator and the first IMU sample. Rejected double taps still emit the **Serial** snapshot (`Command gate: REJECTED`) but **no** LED animation.
+   - **After recording:** the playful multi-color **`playDoubleTapCue()`** rainbow runs **once capture finishes** and the notify-chunk transfer has been issued; it is **not** inserted between the phone’s **RECORDING_PENDING** indicator and the first IMU sample. Rejected double taps still emit the **Serial** snapshot (`Command gate: REJECTED`) but **no** LED animation.
 
 5. **Post-accept IMU recording (up to ~4 s wall clock)**  
    After an **accepted** double tap, firmware sends **`RECORDING_PENDING`** (framed **`pkt = 4`**) with the upcoming **`window_id`**, runs a few **`BLE.poll()`** cycles so the notify can reach the stack, then **starts sampling immediately**. There is **no** long pre-roll delay or pre-capture LED sequence—the companion app’s “recording” UI should match the IMU window closely (remaining skew is BLE connection-interval scheduling on the phone). The capture loop stops when **`millis()` elapsed ≥ `kRecordDurationMs`** (default **4000 ms**) or the ring buffer max count is reached.
@@ -37,9 +37,9 @@ Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/lin
    - **Constants:** `kRecordDurationMs`, `kRecordSamplePeriodMs`, `kRecordMaxSamples` in `src/main.cpp`.
 
 6. **Serial during recordings**  
-   Human-readable **CSV dumps after each capture are disabled** (Serial noise). Inspect captures via the phone app (GATT pull after **META**). Serial still logs tap snapshots and **`BLE: META …`** / **`BLE: META sent — central should GATT-pull payload …`** tracing.
+   Human-readable **CSV dumps after each capture are disabled** (Serial noise). Inspect captures via the phone app (notify chunks after **META**). Serial still logs tap snapshots and **`BLE: META …`** / **`BLE: notify chunks sent …`** tracing.
 
-   **Packing:** `packImuSampleBleLittleEndian()` writes **14 bytes/sample** (LE **`uint16_t t_ms`**, then six LE **`int16_t`** raw axes). The entire packed buffer lives in RAM until the central finishes pulling it or the next capture overwrites it.
+   **Packing:** `packImuSampleBleLittleEndian()` writes **14 bytes/sample** (LE **`uint16_t t_ms`**, then six LE **`int16_t`** raw axes). The entire packed buffer lives in RAM while notify chunks are sent and remains staged for fallback pull until the next capture overwrites it.
 
 7. **Serial**  
    **115200 baud** (`platformio.ini` → `monitor_speed`). On boot, firmware waits briefly for USB Serial so logs appear when a monitor is open without blocking forever when USB is unplugged. BLE setup also logs success/failure (`BLE: advertising as "…"` or `advertise() failed`).
@@ -51,14 +51,14 @@ Companion mobile app: **`abracadabra-rnapp`** (React Native) implements scan/lin
    - **Advertising:** Primary payload carries **flags + Complete Local Name** so the name fits in **31 bytes**. A **128-bit service UUID is not broadcast** in ADV (it would crowd out the name); the custom service still exists **on GATT** after connect.
    - **Custom GATT:** Service **`ADAB0001-0000-1000-8000-00805F9B34FB`**
      - Read-only byte **`ADAB0002-…`** (status placeholder).
-     - **`ADAB0003-…` (NOTIFY / write response channel):** Framed packets share header **magic `0xADAB`** (LE `uint16`), **`pkt` byte**, reserved **`0`**. **`RECORDING_PENDING` (`pkt = 4`):** sent **immediately before** the peripheral begins filling the IMU capture buffer — payload **4 bytes LE:** `window_id` u16, `proto_ver` u8, reserved u8 — so the central can turn on **“recording”** in sync with data collection (within normal BLE timing). **`META` (`pkt = 1`):** after capture completes — payload **16 bytes LE:** `window_id` u16, `sample_count` u16, `total_bytes` u32 (`sample_count × 14`), `proto_ver` u8 + 3 reserved bytes, **`crc_ieee_u32`** over the **full packed payload** the central must pull. No bulk payload in notify.
-     - **`ADAB0004-…` (write):** Central writes **4-byte little-endian byte offset** into the staged packed recording. Peripheral prepares **`ADAB0005`** read data for the **next** GATT read (pull model in `src/main.cpp`).
-     - **`ADAB0005-…` (read):** Central reads the slice staged after the last **`ADAB0004`** write. Repeat until **`total_bytes`** are read; verify CRC against **META**.
+     - **`ADAB0003-…` (NOTIFY / transfer channel):** Framed packets share header **magic `0xADAB`** (LE `uint16`), **`pkt` byte**, reserved **`0`**. Notify frame values are capped at **182 bytes** because iOS commonly negotiates **ATT_MTU 185** (`MTU - 3` usable notify bytes), and chunks are paced by **`kBleNotifyChunkPaceMs`** so CoreBluetooth has time to drain the stream. **`RECORDING_PENDING` (`pkt = 4`):** sent **immediately before** the peripheral begins filling the IMU capture buffer — payload **4 bytes LE:** `window_id` u16, `proto_ver` u8, reserved u8 — so the central can turn on **“recording”** in sync with data collection (within normal BLE timing). **`META` (`pkt = 1`):** after capture completes — payload **16 bytes LE:** `window_id` u16, `sample_count` u16, `total_bytes` u32 (`sample_count × 14`), `proto_ver` u8 + 3 reserved bytes, **`crc_ieee_u32`** over the **full packed payload**. **`CHUNK` (`pkt = 2`):** payload **`window_id` u16 + `offset` u32 + `data_len` u16 + packed bytes**; chunks use the same raw buffer declared by **META**. **`COMMIT` (`pkt = 3`):** payload **`window_id` u16 + `total_bytes` u32 + `crc_ieee_u32` + `proto_ver` u8 + reserved**; firmware repeats this small packet **`kBleCommitRepeatCount`** times. The app accepts the recording only after all bytes are present and the full-buffer CRC matches. If a notify stream arrives incomplete or stalls before **COMMIT**, the app can recover via the staged fallback pull characteristics below instead of using partial data.
+     - **`ADAB0004-…` (write):** Compatibility / diagnostic pull fallback. Central writes **4-byte little-endian byte offset** into the staged packed recording. Peripheral prepares **`ADAB0005`** read data for the **next** GATT read (pull model in `src/main.cpp`).
+     - **`ADAB0005-…` (read):** Compatibility / diagnostic pull fallback. Central reads the slice staged after the last **`ADAB0004`** write. Repeat until **`total_bytes`** are read; verify CRC against **META**.
      - Sample packing in RAM / over the wire: LE **`uint16_t t_ms`**, then six LE **`int16_t`** accel + gyro (`packImuSampleBleLittleEndian`).
    - **Link-up cue:** When a central **first connects** (GAP link established after “pairing” from the phone), firmware runs **`bleHandshakeLedCue()`** — three quick **cyan ↔ magenta** bursts on the RGB LED (distinct from the double-tap rainbow). Serial prints `BLE: central connected (link up).` Disconnect clears the latch so the next connection flashes again.
-   - **Main loop:** **`blePollServicing()`** wraps **`BLE.poll()`** and is used everywhere the stack is serviced so connection edges are detected while waiting for double-tap (`idleUntilDoubleTapInterrupt`), during LED cues, recording, and GATT pull servicing.
+   - **Main loop:** **`blePollServicing()`** wraps **`BLE.poll()`** and is used everywhere the stack is serviced so connection edges are detected while waiting for double-tap (`idleUntilDoubleTapInterrupt`), during LED cues, recording, notify chunking, and fallback GATT pull servicing.
 
-   Dependencies: [`arduino-libraries/ArduinoBLE`](https://github.com/arduino-libraries/ArduinoBLE) in `platformio.ini`. The React Native app handles **`RECORDING_PENDING`** and **`META`** on **`ADAB0003`**, pulls bytes via **`ADAB0004`**/**`ADAB0005`**, and validates **CRC** (failed pulls discarded).
+   Dependencies: [`arduino-libraries/ArduinoBLE`](https://github.com/arduino-libraries/ArduinoBLE) in `platformio.ini`. The React Native app handles **`RECORDING_PENDING`**, **`META`**, **`CHUNK`**, and **`COMMIT`** on **`ADAB0003`**, assembles the raw bytes by offset, and validates **CRC** before decoding. **`ADAB0004`**/**`ADAB0005`** remain staged as a pull fallback: the iPhone path is notify-chunk first, then pull recovery if the notify stream is incomplete.
 
 ## IMU (LSM6DS3TR-C)
 
@@ -91,7 +91,7 @@ Recommended JSON shape when the app labels crops or sends a full recording to **
 }
 ```
 
-`window_id` increments per accepted recording on device; `t_ms` starts at **0** at the beginning of that capture window (first sample after **`RECORDING_PENDING`**). `window_id` and `t_ms` are timing/trace metadata for the app/server, not gesture identity features. The server trains on raw axes and derived motion features.
+`window_id` increments per accepted recording on device; `t_ms` starts at **0** at the beginning of that capture window (first sample after **`RECORDING_PENDING`**). `window_id` and `t_ms` are timing/trace metadata for the app/server, not gesture identity features. The server trains on raw axes and derived motion features. Multi-gesture passwords (e.g. double-tap then wrist rotation then tap in one ~4 s window) are segmented and de-overlapped in **`abracadabra_gesture_processing`**, not on the MCU.
 
 ### Sample rate vs BLE
 
@@ -101,11 +101,12 @@ Recommended JSON shape when the app labels crops or sends a full recording to **
 | **Hardware headroom** | IMU ODR is **416 Hz**. **`kRecordSamplePeriodMs = 5`** targets **~200 Hz**; shorter periods raise the rate further but need enough CPU + I²C time per tick and a larger `kRecordMaxSamples` buffer. |
 | **Payload size** | Each stored sample is **14 bytes**: **2 bytes** nominal `t_ms` (`uint16_t` LE) + **12 bytes** raw axes (**six** `int16_t` LE). A **full** 4 s capture at **200 Hz** would be **≈ 800 × 14 ≈ 11.2 KB**; **416 Hz** would be roughly double (~23 KB). Real captures may be smaller if fewer samples were stored in **`kRecordDurationMs`**. |
 | **Nominal vs actual sample count** | **`t_ms`** is **`index × period`** (ideal grid). Busy loops (BLE polling, I²C) can yield **fewer samples** in **`kRecordDurationMs`** wall time than `duration / period`; the companion app’s timeline shows the resulting **`t_ms`** span. |
-| **BLE pull throughput** | Payload is read in **GATT read** slices after **META**. Transfer time depends on **connection interval**, **ATT MTU**, and **central read scheduling**. Larger MTU reduces overhead per round-trip; the RN app requests **MTU 247** on Android when supported. |
+| **iOS BLE throughput** | Payload bytes are pushed as **ADAB0003 notify chunks** after **META**. Frames are capped at **182 bytes** for the common iOS **ATT_MTU 185** case and paced by **`kBleNotifyChunkPaceMs`**; this avoids the old write-offset + read-slice round trip per chunk, which matters on iOS/CoreBluetooth where app code does not directly control MTU the way Android does. Quality is unchanged because the same packed bytes and full-buffer CRC are used. If notifies are still incomplete, the app falls back to GATT pull for that same staged payload. |
+| **Transfer debug logs** | Serial prints **`BLE: CHUNK progress ...`**, **`BLE: notify chunks sent ...`**, and **`BLE: COMMIT sent ...`** so you can compare firmware-side bytes/chunks with the app’s **`[BleRx]`** / **`[BlePull]`** logs when diagnosing a stuck **Processing** state. |
 
 **Practical note:** **200 Hz** nominal grid is a good default for wrist taps and rotations before chasing full **416 Hz** capture (more samples, more airtime, diminishing returns for many classifiers).
 
-**Status:** Custom service, **RECORDING_PENDING** + **META** notify on **`ADAB0003`**, **GATT pull** (`ADAB0004` / `ADAB0005`), **CRC**, and **14-byte LE** packing are implemented in `src/main.cpp` and consumed by **`abracadabra-rnapp`**.
+**Status:** Custom service, **RECORDING_PENDING** + **META** + **CHUNK** + **COMMIT** notify on **`ADAB0003`**, fallback **GATT pull** (`ADAB0004` / `ADAB0005`), **CRC**, and **14-byte LE** packing are implemented in `src/main.cpp` and consumed by **`abracadabra-rnapp`**.
 
 ## Build and upload
 
