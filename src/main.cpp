@@ -29,6 +29,12 @@ static constexpr uint8_t kBlePktChunk = 2;
 static constexpr uint8_t kBlePktCommit = 3;
 /** Payload 4 B: window_id u16 LE, proto_ver u8, reserved u8 — sent immediately before IMU capture starts (central UI aligns with data). */
 static constexpr uint8_t kBlePktRecordingPending = 4;
+/**
+ * Payload 10 B: window_id u16, max_samples u16, sample_period_ms u8, proto_ver u8, max_total_bytes u32.
+ * Sent right before capture starts; CHUNKs then stream live *during* capture and
+ * COMMIT/META carry the authoritative final byte count + CRC (early-stop can shorten the window).
+ */
+static constexpr uint8_t kBlePktStart = 5;
 static constexpr uint8_t kBleProtoVer = 1;
 /** iOS commonly exposes ATT_MTU 185, so notify values must stay <= 182 bytes (MTU - 3). */
 static constexpr size_t kBleNotifyFrameMaxBytes = 182;
@@ -74,6 +80,20 @@ static constexpr uint8_t kRecordSamplePeriodMs = 5;  // ~200 Hz
 static constexpr uint16_t kRecordMaxSamples =
     static_cast<uint16_t>(kRecordDurationMs / kRecordSamplePeriodMs + 1);
 
+/**
+ * Early stop: end capture once the wrist has clearly moved and then stayed still.
+ * Only trailing stillness is dropped, so classification quality is unchanged;
+ * set kEarlyStopEnabled=false to always record the full window.
+ */
+static constexpr bool kEarlyStopEnabled = true;
+static constexpr uint16_t kEarlyStopMinCaptureMs = 1500;
+static constexpr uint16_t kEarlyStopStillWindowMs = 600;
+static constexpr float kEarlyStopStillGyroMaxDps = 30.0f;
+static constexpr float kEarlyStopMotionGyroMinDps = 80.0f;
+
+/** Full multi-line snapshot dump delays capture start; keep off unless debugging tap gating. */
+static constexpr bool kVerboseTapSnapshot = false;
+
 struct ImuRecordSample {
   uint16_t t_ms;
   int16_t ax;
@@ -109,6 +129,43 @@ static bool sBleCentralWasConnected = false;
 static void blePollServicing();
 
 static void serviceBlePullRequests();
+
+/** Idle "alive" blip cadence — shows the wearable is powered and what the link state is. */
+static constexpr uint16_t kIdleHeartbeatPeriodMs = 2400;
+static constexpr uint16_t kIdleHeartbeatBlipMs = 45;
+
+/** Blink an RGB color n times; services BLE between steps so cues never stall the link. */
+static void ledBlinkPattern(uint8_t r, uint8_t g, uint8_t b, uint8_t count,
+                            uint16_t onMs, uint16_t offMs) {
+  for (uint8_t i = 0; i < count; ++i) {
+    ledSet(r, g, b);
+    delay(onMs);
+    blePollServicing();
+    ledOff();
+    if (i + 1 < count) {
+      delay(offMs);
+      blePollServicing();
+    }
+  }
+}
+
+/**
+ * Status blip while waiting for a double tap:
+ * single blue = powered + advertising, cyan double = phone linked and ready.
+ */
+static void idleHeartbeatTick() {
+  static uint32_t lastBeatMs = 0;
+  const uint32_t now = millis();
+  if (now - lastBeatMs < kIdleHeartbeatPeriodMs) {
+    return;
+  }
+  lastBeatMs = now;
+  if (sBleCentralWasConnected) {
+    ledBlinkPattern(0, 1, 1, 2, kIdleHeartbeatBlipMs, 90);  // cyan double
+  } else {
+    ledBlinkPattern(0, 0, 1, 1, kIdleHeartbeatBlipMs, 0);   // blue single
+  }
+}
 
 /** Short cyan/magenta bursts — distinct from double-tap rainbow; runs during link-up. */
 static void bleHandshakeLedCue() {
@@ -245,6 +302,24 @@ static bool serialPrintImuSnapshot(uint8_t tapSrc) {
       fabsf(gzDps) <= kStillGyroMaxDps;
   const bool acceptedCommand = acceptedPose && stillEnough;
 
+  if (!kVerboseTapSnapshot) {
+    Serial.print(F("Double tap: "));
+    Serial.print(acceptedCommand ? F("ACCEPTED") : F("REJECTED"));
+    Serial.print(F(" pose(g)="));
+    Serial.print(axG, 2);
+    Serial.print(F("/"));
+    Serial.print(ayG, 2);
+    Serial.print(F("/"));
+    Serial.print(azG, 2);
+    Serial.print(F(" gyro(dps)="));
+    Serial.print(gxDps, 1);
+    Serial.print(F("/"));
+    Serial.print(gyDps, 1);
+    Serial.print(F("/"));
+    Serial.println(gzDps, 1);
+    return acceptedCommand;
+  }
+
   Serial.println();
   Serial.println(F("======== Double tap — settled IMU snapshot ========"));
   Serial.print(F("Snapshot timing: waited "));
@@ -332,6 +407,11 @@ static bool serialPrintImuSnapshot(uint8_t tapSrc) {
  * Use when streaming via GATT; not printed on Serial for now.
  */
 static constexpr size_t kBlePackedSampleBytes = 14;
+
+/** Live streaming during capture: one notify per 12 samples (168 B ≤ 170 B chunk budget, every ~60 ms). */
+static constexpr uint16_t kBleLiveChunkSamples = 12;
+static constexpr uint32_t kBleLiveChunkBytes =
+    static_cast<uint32_t>(kBleLiveChunkSamples) * kBlePackedSampleBytes;
 
 static void packImuSampleBleLittleEndian(const ImuRecordSample& s,
                                          uint8_t out[kBlePackedSampleBytes]) {
@@ -442,22 +522,56 @@ static bool bleNotifyRecordingPending(uint16_t windowId) {
   return true;
 }
 
-static bool bleNotifyRecordingChunks(uint16_t windowId, const uint8_t* packed, uint32_t totalBytes, uint32_t crc) {
+/** Announce the capture window so the central can pre-allocate before live CHUNKs arrive. */
+static bool bleNotifyRecordingStart(uint16_t windowId, uint16_t maxSamples) {
+  uint8_t payload[10];
+  putU16Le(payload + 0, windowId);
+  putU16Le(payload + 2, maxSamples);
+  payload[4] = kRecordSamplePeriodMs;
+  payload[5] = kBleProtoVer;
+  putU32Le(payload + 6,
+           static_cast<uint32_t>(maxSamples) * static_cast<uint32_t>(kBlePackedSampleBytes));
+  if (!bleNotifyFramed(kBlePktStart, payload, sizeof(payload))) {
+    Serial.println(F("BLE: START notify failed."));
+    return false;
+  }
+  Serial.println(F("BLE: START sent — streaming live during capture."));
+  return true;
+}
+
+/** Notify a single CHUNK frame covering packed[offset, offset+n). */
+static bool bleNotifyChunkAt(uint16_t windowId, const uint8_t* packed, uint32_t offset, uint16_t n) {
   uint8_t payload[kBleChunkPayloadHeaderBytes + kBleChunkDataMaxBytes];
-  uint32_t offset = 0;
+  putU16Le(payload + 0, windowId);
+  putU32Le(payload + 2, offset);
+  putU16Le(payload + 6, n);
+  memcpy(payload + kBleChunkPayloadHeaderBytes, packed + offset, n);
+  return bleNotifyFramed(kBlePktChunk, payload, kBleChunkPayloadHeaderBytes + n);
+}
+
+/**
+ * Flush packed[startOffset, totalBytes) as paced CHUNK notifies, then COMMIT.
+ * startOffset > 0 when live streaming during capture already sent a prefix.
+ */
+static bool bleNotifyRecordingChunks(uint16_t windowId, const uint8_t* packed, uint32_t startOffset,
+                                     uint32_t totalBytes, uint32_t crc) {
+  uint32_t offset = startOffset;
   uint16_t chunkCount = 0;
-  uint32_t nextLogBytes = 1024;
+  uint32_t nextLogBytes = ((startOffset / 1024) + 1) * 1024;
 
   while (offset < totalBytes) {
     const uint32_t remain = totalBytes - offset;
     const uint16_t n = static_cast<uint16_t>(
         remain < kBleChunkDataMaxBytes ? remain : kBleChunkDataMaxBytes);
-    putU16Le(payload + 0, windowId);
-    putU32Le(payload + 2, offset);
-    putU16Le(payload + 6, n);
-    memcpy(payload + kBleChunkPayloadHeaderBytes, packed + offset, n);
-    if (!bleNotifyFramed(kBlePktChunk, payload, kBleChunkPayloadHeaderBytes + n)) {
+    // Blue flicker = transfer flush in progress (distinct from the capture flash).
+    if ((chunkCount & 1U) == 0) {
+      ledSet(0, 0, 1);
+    } else {
+      ledOff();
+    }
+    if (!bleNotifyChunkAt(windowId, packed, offset, n)) {
       Serial.println(F("BLE: CHUNK notify failed."));
+      ledOff();
       return false;
     }
     offset += n;
@@ -486,6 +600,7 @@ static bool bleNotifyRecordingChunks(uint16_t windowId, const uint8_t* packed, u
   for (uint8_t i = 0; i < kBleCommitRepeatCount; ++i) {
     if (!bleNotifyFramed(kBlePktCommit, commit, sizeof(commit))) {
       Serial.println(F("BLE: COMMIT notify failed."));
+      ledOff();
       return false;
     }
     if (i + 1 < kBleCommitRepeatCount) {
@@ -493,6 +608,7 @@ static bool bleNotifyRecordingChunks(uint16_t windowId, const uint8_t* packed, u
       blePollServicing();
     }
   }
+  ledOff();
 
   Serial.print(F("BLE: notify chunks sent chunks="));
   Serial.print(chunkCount);
@@ -502,22 +618,24 @@ static bool bleNotifyRecordingChunks(uint16_t windowId, const uint8_t* packed, u
 }
 
 /**
- * Notify META (includes CRC), then stream packed bytes as iOS-friendly CHUNK notifies.
+ * Finish a (partially) live-streamed recording: notify META (authoritative
+ * sample count + CRC, since early stop can shorten the window), flush any
+ * bytes not yet streamed during capture, then COMMIT.
  * ADAB0004/0005 pull remains staged as a diagnostic / compatibility fallback.
+ * Packed bytes are produced during capture; liveSentBytes marks the streamed prefix.
+ * Returns true when the full stream (META → chunks → COMMIT) was delivered.
  */
-static void bleTryPushRecording(uint16_t windowId, uint16_t sampleCount) {
+static bool bleTryPushRecording(uint16_t windowId, uint16_t sampleCount, uint32_t liveSentBytes) {
   if (sampleCount == 0) {
-    return;
+    return false;
   }
-
-  sBlePullReady = false;
-  sBlePullPackedPtr = nullptr;
-  sBlePullTotalBytes = 0;
 
   BLEDevice central = BLE.central();
   if (!central || !central.connected()) {
     Serial.println(F("BLE: recording ready but no central — skipping transfer."));
-    return;
+    // Magenta double-blink: gesture captured, but no phone linked to receive it.
+    ledBlinkPattern(1, 0, 1, 2, 120, 120);
+    return false;
   }
 
   uint8_t* packed = sBlePackedRecording;
@@ -525,11 +643,11 @@ static void bleTryPushRecording(uint16_t windowId, uint16_t sampleCount) {
       static_cast<uint32_t>(sampleCount) * static_cast<uint32_t>(kBlePackedSampleBytes);
   if (totalBytes > sizeof(sBlePackedRecording)) {
     Serial.println(F("BLE: packed recording overflow."));
-    return;
+    ledBlinkPattern(1, 0, 0, 3, 100, 100);
+    return false;
   }
-
-  for (uint16_t i = 0; i < sampleCount; ++i) {
-    packImuSampleBleLittleEndian(sRecordBuf[i], packed + static_cast<size_t>(i) * kBlePackedSampleBytes);
+  if (liveSentBytes > totalBytes) {
+    liveSentBytes = totalBytes;
   }
 
   const uint32_t crc = crc32Ieee(packed, totalBytes);
@@ -560,45 +678,79 @@ static void bleTryPushRecording(uint16_t windowId, uint16_t sampleCount) {
     Serial.println(F("BLE: META notify failed."));
     sBlePullPackedPtr = nullptr;
     sBlePullTotalBytes = 0;
-    return;
+    ledBlinkPattern(1, 0, 0, 3, 100, 100);
+    return false;
   }
 
   sBlePullReady = true;
-  Serial.println(F("BLE: META sent — streaming payload by CHUNK notify (ADAB0003)."));
-  if (!bleNotifyRecordingChunks(windowId, packed, totalBytes, crc)) {
+  Serial.print(F("BLE: META sent — flushing tail from "));
+  Serial.print(liveSentBytes);
+  Serial.print(F("/"));
+  Serial.print(totalBytes);
+  Serial.println(F(" bytes (rest streamed live during capture)."));
+  if (!bleNotifyRecordingChunks(windowId, packed, liveSentBytes, totalBytes, crc)) {
     Serial.println(F("BLE: notify chunk stream failed — GATT pull fallback remains staged (ADAB0004/0005)."));
-    return;
+    // Red triple-blink: stream broke mid-flush; the phone may still recover via GATT pull.
+    ledBlinkPattern(1, 0, 0, 3, 100, 100);
+    return false;
   }
   Serial.println(F("BLE: COMMIT sent — central should CRC/decode streamed payload."));
+  return true;
 }
 
-/** Flash green while recording (~4 Hz). */
-static void recordingLedTick(uint32_t elapsedMs) {
+/**
+ * Flash while recording (~4 Hz): cyan when chunks are streaming live to the
+ * phone, green when capturing without a live stream (offline / stream failed).
+ */
+static void recordingLedTick(uint32_t elapsedMs, bool streamingLive) {
   constexpr uint16_t kFlashHalfPeriodMs = 125;
   const bool on = ((elapsedMs / kFlashHalfPeriodMs) & 1U) == 0;
-  if (on) {
-    ledSet(0, 1, 0);
-  } else {
+  if (!on) {
     ledOff();
+  } else if (streamingLive) {
+    ledSet(0, 1, 1);
+  } else {
+    ledSet(0, 1, 0);
   }
 }
 
 /**
- * Captures fixed-rate raw IMU samples for kRecordDurationMs.
- * t_ms is nominal (sample index * period) for ML timeline alignment.
+ * Captures fixed-rate raw IMU samples for kRecordDurationMs (or until the wrist
+ * settles, when early stop is enabled). t_ms is nominal (sample index * period)
+ * for ML timeline alignment.
+ *
+ * Samples are packed into sBlePackedRecording as they are read, and full live
+ * chunks are notified from the idle wait between sample deadlines so the
+ * central receives the recording *while* it is being captured. Bytes already
+ * streamed are reported via liveSentBytesOut; the caller flushes the rest.
  */
-static uint16_t captureImuRecordingWindow() {
+static uint16_t captureImuRecordingWindow(uint16_t windowId, uint32_t* liveSentBytesOut) {
   const uint32_t wallStart = millis();
   uint32_t nextDeadline = wallStart;
   uint16_t count = 0;
+  uint32_t sentBytes = 0;
+  bool liveStreamOk = true;
+  bool motionSeen = false;
+  uint16_t stillRunMs = 0;
 
   while (count < kRecordMaxSamples) {
     const uint32_t now = millis();
     const uint32_t elapsed = now - wallStart;
-    recordingLedTick(elapsed);
+    recordingLedTick(elapsed, liveStreamOk && sentBytes > 0);
 
     if (static_cast<int32_t>(now - nextDeadline) < 0) {
       blePollServicing();
+      const uint32_t packedBytes =
+          static_cast<uint32_t>(count) * static_cast<uint32_t>(kBlePackedSampleBytes);
+      if (liveStreamOk && packedBytes - sentBytes >= kBleLiveChunkBytes) {
+        if (bleNotifyChunkAt(windowId, sBlePackedRecording, sentBytes,
+                             static_cast<uint16_t>(kBleLiveChunkBytes))) {
+          sentBytes += kBleLiveChunkBytes;
+        } else {
+          // Stop live sends; the post-capture flush retries from sentBytes.
+          liveStreamOk = false;
+        }
+      }
       continue;
     }
 
@@ -616,7 +768,33 @@ static uint16_t captureImuRecordingWindow() {
     s.gx = imu.readRawGyroX();
     s.gy = imu.readRawGyroY();
     s.gz = imu.readRawGyroZ();
+    packImuSampleBleLittleEndian(
+        s, sBlePackedRecording + static_cast<size_t>(count) * kBlePackedSampleBytes);
     count++;
+
+    if (kEarlyStopEnabled) {
+      const float gxDps = fabsf(imu.calcGyro(s.gx));
+      const float gyDps = fabsf(imu.calcGyro(s.gy));
+      const float gzDps = fabsf(imu.calcGyro(s.gz));
+      const float gMaxDps = fmaxf(gxDps, fmaxf(gyDps, gzDps));
+      if (gMaxDps >= kEarlyStopMotionGyroMinDps) {
+        motionSeen = true;
+      }
+      if (gMaxDps <= kEarlyStopStillGyroMaxDps) {
+        if (stillRunMs < 0xFFFF - kRecordSamplePeriodMs) {
+          stillRunMs += kRecordSamplePeriodMs;
+        }
+      } else {
+        stillRunMs = 0;
+      }
+      if (motionSeen && elapsed >= kEarlyStopMinCaptureMs &&
+          stillRunMs >= kEarlyStopStillWindowMs) {
+        Serial.print(F("Capture: early stop at "));
+        Serial.print(elapsed);
+        Serial.println(F(" ms (gesture finished)."));
+        break;
+      }
+    }
 
     nextDeadline += kRecordSamplePeriodMs;
     if (static_cast<int32_t>(now - nextDeadline) > static_cast<int32_t>(kRecordSamplePeriodMs)) {
@@ -625,6 +803,7 @@ static uint16_t captureImuRecordingWindow() {
   }
 
   ledOff();
+  *liveSentBytesOut = sentBytes;
   return count;
 }
 
@@ -680,6 +859,7 @@ static void playDoubleTapCue() {
 static void idleUntilDoubleTapInterrupt() {
   while (!imuIntPending) {
     blePollServicing();
+    idleHeartbeatTick();
     __WFI();
   }
 }
@@ -763,10 +943,22 @@ void loop() {
       for (uint8_t i = 0; i < 8; ++i) {
         blePollServicing();
       }
-      const uint16_t n = captureImuRecordingWindow();
-      bleTryPushRecording(sRecordingWindowId, n);
-      playDoubleTapCue();
+      // Capture overwrites the packed buffer live — retire the previous pull staging.
+      sBlePullReady = false;
+      sBlePullPackedPtr = nullptr;
+      sBlePullTotalBytes = 0;
+      (void)bleNotifyRecordingStart(sRecordingWindowId, kRecordMaxSamples);
+      uint32_t liveSentBytes = 0;
+      const uint16_t n = captureImuRecordingWindow(sRecordingWindowId, &liveSentBytes);
+      const bool delivered = bleTryPushRecording(sRecordingWindowId, n, liveSentBytes);
+      if (delivered) {
+        // Full rainbow celebration only when the phone actually got the spell.
+        playDoubleTapCue();
+      }
       Serial.flush();
+    } else {
+      // Tap seen but pose/stillness gate rejected it — show why nothing happened.
+      ledBlinkPattern(1, 0, 0, 2, 90, 90);
     }
   }
 
